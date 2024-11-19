@@ -1,5 +1,5 @@
 apt update
-apt upgrade
+apt -y upgrade
 apt-get -y install dialog apt-utils
 pip install --upgrade pip
 rm requirements.txt
