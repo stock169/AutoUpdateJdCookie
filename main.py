@@ -3,6 +3,7 @@ import argparse
 import asyncio
 from api.qinglong import QlApi, QlOpenApi
 from api.send import SendApi
+from utils.ck import get_invalid_ck_ids
 from config import (
     qinglong_data,
     user_datas,
@@ -12,6 +13,7 @@ import json
 from loguru import logger
 import os
 from playwright.async_api import Playwright, async_playwright
+from playwright._impl._errors import TimeoutError
 import random
 import re
 from PIL import Image  # 用于图像处理
@@ -63,6 +65,24 @@ async def download_image(url, filepath):
                 print(f"Image downloaded to {filepath}")
             else:
                 print(f"Failed to download image. Status code: {response.status}")
+
+
+async def check_notice(page):
+    try:
+        logger.info("检查登录是否报错")
+        notice = await page.wait_for_function(
+            """
+            () => {
+                const notice = document.querySelectorAll('.notice')[1];
+                return notice && notice.textContent.trim() !== '' ? notice.textContent.trim() : false;
+            }
+            """,
+            timeout = 3000
+        )
+        raise RuntimeError(notice)
+    except TimeoutError:
+        logger.info("登录未发现报错")
+        return
 
 
 async def auto_move_slide(page, retry_times: int = 2, slider_selector: str = 'img.move-img', move_solve_type: str = ""):
@@ -130,6 +150,8 @@ async def auto_shape(page, retry_times: int = 5):
     ocr = get_ocr(beta=True)
     # 文字识别
     det = get_ocr(det=True)
+    # 自己训练的ocr, 提高文字识别度
+    my_ocr = get_ocr(det=False, ocr=False, import_onnx_path="myocr_v1.onnx", charsets_path="charsets.json")
     """
     自动识别滑块验证码
     """
@@ -158,7 +180,7 @@ async def auto_shape(page, retry_times: int = 5):
 
         # 获取 图片的src 属性和button按键
         word_img_src = await page.locator('div.captcha_footer img').get_attribute('src')
-        button = page.locator('div.captcha_footer button.sure_btn')
+        button = page.locator('div.captcha_footer button#submit-btn')
 
         # 找到刷新按钮
         refresh_button = page.locator('.jcap_refresh')
@@ -216,11 +238,14 @@ async def auto_shape(page, retry_times: int = 5):
             target_char_len = len(target_char_list)
 
             # 识别字数不对
-            if target_char_len != 4:
-                logger.info(f'识别的字数不对,刷新中......')
+            if target_char_len < 4:
+                logger.info(f'识别的字数小于4,刷新中......')
                 await refresh_button.click()
                 await asyncio.sleep(random.uniform(2, 4))
                 continue
+
+            # 取前4个的文字
+            target_char_list = target_char_list[:4]
 
             # 定义【文字, 坐标】的列表
             target_list = [[x, []] for x in target_char_list]
@@ -241,7 +266,7 @@ async def auto_shape(page, retry_times: int = 5):
                 im2 = im[expanded_y1:expanded_y2, expanded_x1:expanded_x2]
                 img_path = cv2_save_img('word', im2)
                 image_bytes = open(img_path, "rb").read()
-                result = ocr.classification(image_bytes, png_fix=True)
+                result = my_ocr.classification(image_bytes)
                 if result in target_char_list:
                     for index, target in enumerate(target_list):
                         if result == target[0] and target[0] is not None:
@@ -256,15 +281,21 @@ async def auto_shape(page, retry_times: int = 5):
                 await asyncio.sleep(random.uniform(2, 4))
                 continue
 
-            for char in target_list:
-                center_x = char[1][0]
-                center_y = char[1][1]
-                # 得到网页上的中心点
-                x, y = backend_top_left_x + center_x, backend_top_left_y + center_y
-                # 点击图片
-                await page.mouse.click(x, y)
-                await asyncio.sleep(random.uniform(1, 4))
-
+            await asyncio.sleep(random.uniform(0, 1))
+            try:
+                for char in target_list:
+                    center_x = char[1][0]
+                    center_y = char[1][1]
+                    # 得到网页上的中心点
+                    x, y = backend_top_left_x + center_x, backend_top_left_y + center_y
+                    # 点击图片
+                    await page.mouse.click(x, y)
+                    await asyncio.sleep(random.uniform(1, 4))
+            except IndexError:
+                logger.info(f'识别文字出错,刷新中......')
+                await refresh_button.click()
+                await asyncio.sleep(random.uniform(2, 4))
+                continue
             # 点击确定
             await button.click()
             await asyncio.sleep(random.uniform(2, 4))
@@ -397,7 +428,12 @@ async def get_jd_pt_key(playwright: Playwright, user, mode) -> Union[str, None]:
         proxy = None
 
     browser = await playwright.chromium.launch(headless=headless, args=args, proxy=proxy)
-    context = await browser.new_context(user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+    try:
+        # 引入UA
+        from config import user_agent
+    except ImportError:
+        from utils.consts import user_agent
+    context = await browser.new_context(user_agent=user_agent)
 
     try:
         page = await context.new_page()
@@ -460,7 +496,7 @@ async def get_jd_pt_key(playwright: Playwright, user, mode) -> Union[str, None]:
             await asyncio.sleep(random.random())
             await page.locator('.policy_tip-checkbox').click()
             await asyncio.sleep(random.random())
-            await page.locator('.btn.J_ping.btn-active').click()
+            await page.locator('.btn.J_ping.active').click()
 
             # 自动识别移动滑块验证码
             await asyncio.sleep(1)
@@ -475,6 +511,9 @@ async def get_jd_pt_key(playwright: Playwright, user, mode) -> Union[str, None]:
             if await page.locator('text="手机短信验证"').count() != 0:
                 logger.info("开始短信验证码识别环节")
                 await sms_recognition(page, user, mode)
+
+            # 检查警告,如账号存在风险或账密不正确等
+            await check_notice(page)
 
         # 等待验证码通过
         logger.info("等待获取cookie...")
@@ -561,6 +600,23 @@ async def main(mode: str = None):
 
         user_info = response['data']
 
+        try:
+            logger.info("检测CK任务开始")
+            ck_ids_data = await get_invalid_ck_ids(user_info)
+            await qlapi.envs_disable(data=ck_ids_data)
+            logger.info("检测CK任务完成")
+        except Exception as e:
+            logger.error(f"检测CK任务失败, 跳过检测, 报错原因为{e}")
+
+        # 再拿一次禁用的用户列表
+        response = await qlapi.get_envs()
+        if response['code'] == 200:
+            logger.info("获取环境变量成功")
+        else:
+            logger.error(f"获取环境变量失败， response: {response}")
+            raise Exception(f"获取环境变量失败， response: {response}")
+
+        user_info = response['data']
         # 获取需强制更新pt_pin
         force_update_pt_pins = [user_datas[key]["pt_pin"] for key in user_datas if user_datas[key].get("force_update") is True]
         # 获取需强制和需要强制更新的users
@@ -571,10 +627,13 @@ async def main(mode: str = None):
             return
 
         # 获取需要的字段
-        filter_users_list = filter_forbidden_users(forbidden_users, ['id', 'value', 'remarks', 'name'])
+        filter_users_list = filter_forbidden_users(forbidden_users, ['_id', 'id', 'value', 'remarks', 'name'])
 
         # 生成字典
         user_dict = get_forbidden_users_dict(filter_users_list, user_datas)
+        if not user_dict:
+            logger.info("失效的CK信息未配置在user_datas内，无需更新")
+            return
 
         # 登录JD获取pt_key
         async with async_playwright() as playwright:
@@ -598,7 +657,8 @@ async def main(mode: str = None):
                     await send_msg(send_api, send_type=1, msg=f"{user} 更新失败")
                     continue
 
-                data = bytes(f"[{req_data['id']}]", 'utf-8')
+                req_id = f"[{req_data['id']}]" if 'id' in req_data.keys() else f'[\"{req_data["_id"]}\"]'
+                data = bytes(req_id, 'utf-8')
                 response = await qlapi.envs_enable(data=data)
                 if response['code'] == 200:
                     logger.info(f"{user}启用成功")
