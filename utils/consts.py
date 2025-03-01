@@ -29,5 +29,9 @@ supported_sms_func = [
     "webhook",
     "manual_input"
 ]
+supported_voice_func = [
+    "no",
+    "manual_input"
+]
 # 默认的UA, 可以在config.py里配置
-user_agent = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Mobile Safari/537.36'
+user_agent = 'Mozilla/5.0 Chrome'
