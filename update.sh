@@ -1,5 +1,7 @@
 apt update
-apt-get -y install dialog apt-utils
+apt-get -y install dialog apt-utils iputils-ping net-tools openssh-server nano
+mkdir /run/sshd
+echo "PermitRootLogin yes" >> /etc/ssh/sshd_config
 apt -y upgrade
 pip install --upgrade pip
 rm requirements.txt
